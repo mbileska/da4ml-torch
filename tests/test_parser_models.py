@@ -41,7 +41,7 @@ class ConvClassifier(torch.nn.Module):
         self.features = LogicConv2d(in_dim=6, channels=1, num_kernels=4, receptive_field_size=3, tree_depth=2)
         self.pool = OrPooling2d(kernel_size=2, stride=2)
         self.flatten = torch.nn.Flatten()
-        self.classifier = LogicDense(in_dim=16, out_dim=4)
+        self.classifier = LogicDense(in_dim=16, out_dim=8)
         self.head = GroupSum(k=2, tau=1.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -10,17 +10,9 @@ class ReplayLogicConv2d(ReplayBase):
 
     def call(self, inputs: FixedVariableArray):
         self.module: LogicConv2d
-
-        # Save solver_options for conversion back
         solver_options = inputs.solver_options
-
-        # Convert FixedVariableArray to numpy array of FixedVariable objects
         inputs_np = np.array(inputs)
-
-        # Call torchlogix forward (which now works with numpy arrays)
         result_np = self.module(inputs_np)
-
-        # Convert back to FixedVariableArray
         return FixedVariableArray(result_np, solver_options=solver_options)
 
 
@@ -29,17 +21,9 @@ class ReplayLogicDense(ReplayBase):
 
     def call(self, inputs: FixedVariableArray):
         self.module: LogicDense
-
-        # Save solver_options for conversion back
         solver_options = inputs.solver_options
-
-        # Convert FixedVariableArray to numpy array of FixedVariable objects
         inputs_np = np.array(inputs)
-
-        # Call torchlogix forward (which now works with numpy arrays)
         result_np = self.module(inputs_np)
-
-        # Convert back to FixedVariableArray
         return FixedVariableArray(result_np, solver_options=solver_options)
 
 
@@ -59,29 +43,32 @@ class ReplayOrPooling2d(ReplayBase):
     def call(self, inputs: FixedVariableArray):
         self.module: OrPooling2d
 
-        # Save solver_options for conversion back
-        solver_options = inputs.solver_options
+        if not isinstance(inputs, FixedVariableArray):
+            return FixedVariableArray(self.module(np.array(inputs)))
 
-        # Convert FixedVariableArray to numpy array of FixedVariable objects
-        inputs_np = np.array(inputs)
+        kernel_size = self.module.kernel_size
+        stride = self.module.stride
+        padding = self.module.padding
 
-        # Call torchlogix forward (which now works with numpy arrays)
-        result_np = self.module(inputs_np)
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
 
-        # Convert back to FixedVariableArray
-        return FixedVariableArray(result_np, solver_options=solver_options)
+        raw = inputs._vars
+        if any(padding):
+            raw = np.pad(
+                raw,
+                ((0, 0), (0, 0), (padding[0], padding[0]), (padding[1], padding[1])),
+                mode='constant',
+                constant_values=0,
+            )
 
-
-# class ReplayOrPooling3d(ReplayBase):
-#     handles = (OrPooling3d,)
-
-#     def call(self, inputs: FixedVariableArray):
-#         self.module: OrPooling3d
-
-#         solver_options = inputs.solver_options
-#         inputs_np = np.array(inputs)
-#         result_np = self.module(inputs_np)
-#         return FixedVariableArray(result_np, solver_options=solver_options)
+        windows = np.lib.stride_tricks.sliding_window_view(raw, kernel_size, axis=(-2, -1))
+        windows = windows[:, :, :: stride[0], :: stride[1], :, :]
+        return np.max(FixedVariableArray(windows, solver_options=inputs.solver_options), axis=(-2, -1))
 
 
 class ReplayGroupSum(ReplayBase):
@@ -89,15 +76,7 @@ class ReplayGroupSum(ReplayBase):
 
     def call(self, inputs: FixedVariableArray):
         self.module: GroupSum
-
-        # Save solver_options for conversion back
         solver_options = inputs.solver_options
-
-        # Convert FixedVariableArray to numpy array of FixedVariable objects
         inputs_np = np.array(inputs)
-
-        # Call torchlogix forward (which now works with numpy arrays)
         result_np = self.module(inputs_np)
-
-        # Convert back to FixedVariableArray
         return FixedVariableArray(result_np, solver_options=solver_options)

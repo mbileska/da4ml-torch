@@ -9,4 +9,6 @@ class ReplayFlatten(ReplayBase):
     handles = (torch.nn.Flatten,)
 
     def call(self, input: FixedVariableArray):
-        return np.ravel(input)[None]  # type: ignore
+        if input.ndim <= 1:
+            return input.flatten()
+        return input.reshape(input.shape[0], -1)
