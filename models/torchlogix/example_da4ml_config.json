@@ -1,0 +1,19 @@
+{
+  "checkpoint": "models/torchlogix/<experiment>/best_model.pt",
+  "training_config": "auto",
+  "architecture": null,
+  "input_shape": [1, 1, 28, 28],
+  "input_kif": [0, 1, 8],
+  "outdir": "build/da4ml/torchlogix_example",
+  "project_name": "model",
+  "flavor": "verilog",
+  "latency_cutoff": 5.0,
+  "clock_period": 5.0,
+  "clock_uncertainty": 10.0,
+  "part_name": "xcvu13p-flga2577-2-e",
+  "hw_config": [1, -1, -1],
+  "validate_comb_samples": 32,
+  "validate_rtl_samples": 0,
+  "synthesis_tool": "none",
+  "report_formats": ["json", "md"]
+}
