@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import pickle
+import re
 import shutil
 import subprocess
 import sys
@@ -16,13 +18,17 @@ import torch
 
 
 DEFAULTS: dict[str, Any] = {
+    'model': None,
+    'model_name': None,
+    'models_root': 'models',
     'checkpoint': None,
     'outdir': None,
-    'project_name': 'model',
+    'project_name': None,
     'architecture': None,
     'training_config': 'auto',
     'model_factory': None,
     'model_kwargs': {},
+    'sequential_fallback': 'auto',
     'input_shape': None,
     'input_kif': None,
     'hw_config': [1, -1, -1],
@@ -54,15 +60,19 @@ CHECKPOINT_PATTERNS = (
     '*best*.pth',
 )
 
+CHECKPOINT_SUFFIXES = ('.pt', '.pth', '.ckpt', '.pkl', '.pickle')
+
 
 @dataclass(frozen=True)
 class LoadedModel:
     model: torch.nn.Module
+    model_name: str | None
     architecture: str | None
     checkpoint: Path | None
     checkpoint_kind: str
     training_config: Path | None
     unsafe_pickle_load: bool
+    load_notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -77,6 +87,10 @@ class ValidationSummary:
 def _path_or_none(value: str | Path | None) -> Path | None:
     if value in (None, '', 'none', 'None'):
         return None
+    return Path(value).expanduser()
+
+
+def _path_value(value: str | Path) -> Path:
     return Path(value).expanduser()
 
 
@@ -141,6 +155,7 @@ def merge_config(args: argparse.Namespace) -> dict[str, Any]:
 
     config['checkpoint'] = _path_or_none(config.get('checkpoint'))
     config['outdir'] = _path_or_none(config.get('outdir'))
+    config['models_root'] = _path_value(config.get('models_root', 'models'))
     training_config = config.get('training_config')
     if training_config != 'auto':
         config['training_config'] = _path_or_none(training_config)
@@ -151,9 +166,21 @@ def merge_config(args: argparse.Namespace) -> dict[str, Any]:
     config['input_kif'] = tuple(config['input_kif']) if config.get('input_kif') is not None else None
     config['hw_config'] = tuple(config['hw_config'])
     config['validation_input_range'] = tuple(config['validation_input_range'])
+    if config.get('sequential_fallback') not in ('auto', 'never'):
+        raise ValueError('sequential_fallback must be "auto" or "never".')
     if isinstance(config.get('report_formats'), str):
         config['report_formats'] = [config['report_formats']]
     return config
+
+
+def _unique_checkpoint(matches: Sequence[Path], requested: str) -> Path | None:
+    unique_matches = sorted(set(path.resolve() for path in matches if path.is_file()))
+    if not unique_matches:
+        return None
+    if len(unique_matches) > 1:
+        formatted = '\n'.join(f'  - {path}' for path in unique_matches)
+        raise RuntimeError(f'Multiple candidate checkpoints found for {requested!r}. Pass --checkpoint explicitly:\n{formatted}')
+    return unique_matches[0]
 
 
 def find_default_checkpoint(models_root: Path = Path('models')) -> Path | None:
@@ -162,26 +189,145 @@ def find_default_checkpoint(models_root: Path = Path('models')) -> Path | None:
     matches: list[Path] = []
     for pattern in CHECKPOINT_PATTERNS:
         matches.extend(models_root.rglob(pattern))
-    unique_matches = sorted(set(path.resolve() for path in matches if path.is_file()))
-    if not unique_matches:
-        return None
-    if len(unique_matches) > 1:
-        formatted = '\n'.join(f'  - {path}' for path in unique_matches)
-        raise RuntimeError(f'Multiple candidate checkpoints found. Pass --checkpoint explicitly:\n{formatted}')
-    return unique_matches[0]
+    return _unique_checkpoint(matches, 'default model')
 
 
-def _torch_load(path: Path) -> tuple[Any, bool]:
+def _checkpoints_in_dir(path: Path) -> list[Path]:
+    matches: list[Path] = []
+    for pattern in CHECKPOINT_PATTERNS:
+        matches.extend(path.glob(pattern))
+    if not matches:
+        matches.extend(item for item in path.iterdir() if item.is_file() and item.suffix in CHECKPOINT_SUFFIXES)
+    return matches
+
+
+def find_named_checkpoint(model_ref: str | Path, models_root: Path = Path('models')) -> Path | None:
+    ref = Path(model_ref).expanduser()
+    if ref.exists():
+        if ref.is_file():
+            return ref.resolve()
+        return _unique_checkpoint(_checkpoints_in_dir(ref), str(model_ref))
+
+    rooted_ref = models_root / ref
+    if rooted_ref.exists():
+        if rooted_ref.is_file():
+            return rooted_ref.resolve()
+        return _unique_checkpoint(_checkpoints_in_dir(rooted_ref), str(model_ref))
+
+    matches: list[Path] = []
+    if ref.suffix:
+        matches.extend(models_root.rglob(ref.name))
+    else:
+        for suffix in CHECKPOINT_SUFFIXES:
+            matches.extend(models_root.rglob(f'{ref.name}{suffix}'))
+        for directory in models_root.rglob(ref.name):
+            if directory.is_dir():
+                matches.extend(_checkpoints_in_dir(directory))
+    return _unique_checkpoint(matches, str(model_ref))
+
+
+class AutoSequentialCheckpointModule(torch.nn.Module):
+    """Fallback top-level module for simple checkpoints whose model class is unavailable."""
+
+    def forward(self, x: Any) -> Any:
+        value: Any = x
+        for child in self.children():
+            value = _call_sequential_child(child, value)
+        return value
+
+
+def _call_sequential_child(child: torch.nn.Module, value: Any) -> Any:
+    if isinstance(child, torch.nn.ModuleList):
+        for module in child:
+            value = _call_sequential_child(module, value)
+        return value
+    if isinstance(child, torch.nn.ModuleDict):
+        for module in child.values():
+            value = _call_sequential_child(module, value)
+        return value
+    if isinstance(value, tuple):
+        return child(*value)
+    return child(value)
+
+
+_AUTO_SEQUENTIAL_CLASS_CACHE: dict[tuple[str, str], type[AutoSequentialCheckpointModule]] = {}
+
+
+def _auto_sequential_class(module_name: str, class_name: str) -> type[AutoSequentialCheckpointModule]:
+    key = (module_name, class_name)
+    if key not in _AUTO_SEQUENTIAL_CLASS_CACHE:
+        _AUTO_SEQUENTIAL_CLASS_CACHE[key] = type(
+            class_name,
+            (AutoSequentialCheckpointModule,),
+            {'__module__': module_name},
+        )
+    return _AUTO_SEQUENTIAL_CLASS_CACHE[key]
+
+
+class _AutoSequentialUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str) -> Any:
+        try:
+            return super().find_class(module, name)
+        except (AttributeError, ModuleNotFoundError):
+            return _auto_sequential_class(module, name)
+
+
+class _AutoSequentialPickleModule:
+    Unpickler = _AutoSequentialUnpickler
+    Pickler = pickle.Pickler
+    dump = staticmethod(pickle.dump)
+    dumps = staticmethod(pickle.dumps)
+    load = staticmethod(pickle.load)
+    loads = staticmethod(pickle.loads)
+
+
+def _torch_load_with_auto_sequential(path: Path) -> Any:
+    return torch.load(path, map_location='cpu', weights_only=False, pickle_module=_AutoSequentialPickleModule)
+
+
+def _torch_load(path: Path, sequential_fallback: str = 'auto') -> tuple[Any, bool, tuple[str, ...]]:
     for candidate in (Path.cwd(), path.resolve().parent):
         candidate_str = str(candidate)
         if candidate_str not in sys.path:
             sys.path.insert(0, candidate_str)
     try:
-        return torch.load(path, map_location='cpu', weights_only=True), False
-    except TypeError:
-        return torch.load(path, map_location='cpu'), True
-    except Exception:
-        return torch.load(path, map_location='cpu', weights_only=False), True
+        return torch.load(path, map_location='cpu', weights_only=True), False, ()
+    except TypeError as weights_arg_error:
+        try:
+            return torch.load(path, map_location='cpu'), True, ()
+        except Exception as full_load_error:
+            if sequential_fallback == 'never':
+                raise full_load_error from weights_arg_error
+            try:
+                payload = _torch_load_with_auto_sequential(path)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    'Unable to load checkpoint as a full PyTorch module or an auto-sequential fallback. '
+                    'If this checkpoint is a state_dict, pass --architecture or --model-factory. If it is a custom '
+                    'module with branching or multiple inputs, pass --model-factory so the original forward method is available.'
+                ) from fallback_error
+            return payload, True, (
+                'Loaded with auto-sequential checkpoint fallback because the original top-level model class was unavailable. '
+                'This is valid for single-input child-module chains; use --model-factory for custom branching forward methods.',
+            )
+    except Exception as weights_only_error:
+        try:
+            return torch.load(path, map_location='cpu', weights_only=False), True, ()
+        except Exception as full_load_error:
+            if sequential_fallback == 'never':
+                raise full_load_error from weights_only_error
+            try:
+                payload = _torch_load_with_auto_sequential(path)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    'Unable to load checkpoint as weights_only, a full PyTorch module, or an auto-sequential fallback. '
+                    'If this checkpoint is a state_dict, pass --architecture or --model-factory. If it is a custom '
+                    'module with branching or multiple inputs, pass --model-factory so the original forward method is available.'
+                ) from fallback_error
+            return payload, True, (
+                'Loaded with auto-sequential checkpoint fallback because the original top-level model class was unavailable. '
+                'This is valid for single-input child-module chains; use --model-factory for custom branching forward methods.',
+            )
 
 
 def _is_state_dict(value: Any) -> bool:
@@ -241,6 +387,38 @@ def _resolve_object(spec: str) -> Any:
     for part in attr.split('.'):
         obj = getattr(obj, part)
     return obj
+
+
+def _name_from_model_ref(model_ref: str | Path | None) -> str | None:
+    if model_ref in (None, ''):
+        return None
+    ref = Path(model_ref)
+    return ref.stem if ref.suffix else ref.name
+
+
+def _sanitize_project_name(name: str) -> str:
+    sanitized = re.sub(r'\W+', '_', name).strip('_')
+    if not sanitized:
+        sanitized = 'model'
+    if sanitized[0].isdigit():
+        sanitized = f'model_{sanitized}'
+    return sanitized
+
+
+def _resolve_model_name(config: dict[str, Any], checkpoint: Path | None, architecture: str | None) -> str | None:
+    configured = config.get('model_name')
+    if configured:
+        return str(configured)
+    ref_name = _name_from_model_ref(config.get('model'))
+    if ref_name:
+        return ref_name
+    if architecture:
+        return architecture
+    if checkpoint is not None:
+        return checkpoint.stem
+    if config.get('model_factory'):
+        return config['model_factory'].replace(':', '.').rsplit('.', 1)[-1]
+    return None
 
 
 def _training_config_path(checkpoint: Path | None, configured: str | Path | None) -> Path | None:
@@ -315,20 +493,32 @@ def instantiate_torchlogix_model(
 
 
 def load_model(config: dict[str, Any]) -> LoadedModel:
-    checkpoint = config['checkpoint'] or find_default_checkpoint()
+    checkpoint = config['checkpoint']
+    if checkpoint is None and config.get('model'):
+        checkpoint = find_named_checkpoint(config['model'], config['models_root'])
+        if checkpoint is None and not config.get('model_factory'):
+            raise FileNotFoundError(
+                f'No checkpoint found for model {config["model"]!r} under {config["models_root"]}. '
+                'Pass --checkpoint or --model-factory.'
+            )
+    if checkpoint is None:
+        checkpoint = find_default_checkpoint(config['models_root'])
     payload: Any = None
     unsafe_pickle_load = False
+    load_notes: tuple[str, ...] = ()
     state_dict: dict[str, torch.Tensor] | None = None
     checkpoint_kind = 'factory'
+    model_name = _resolve_model_name(config, checkpoint, config.get('architecture'))
 
     if checkpoint is not None:
         checkpoint = checkpoint.resolve()
         if not checkpoint.exists():
             raise FileNotFoundError(f'Checkpoint not found: {checkpoint}')
-        payload, unsafe_pickle_load = _torch_load(checkpoint)
+        payload, unsafe_pickle_load, load_notes = _torch_load(checkpoint, config['sequential_fallback'])
         if isinstance(payload, torch.nn.Module):
             model = payload
-            return LoadedModel(model, None, checkpoint, 'full_module', None, unsafe_pickle_load)
+            kind = 'full_module_auto_sequential' if isinstance(model, AutoSequentialCheckpointModule) else 'full_module'
+            return LoadedModel(model, model_name, None, checkpoint, kind, None, unsafe_pickle_load, load_notes)
         state_dict, checkpoint_kind = _extract_state_dict(payload)
 
     if config.get('model_factory'):
@@ -338,7 +528,7 @@ def load_model(config: dict[str, Any]) -> LoadedModel:
             raise TypeError(f'Model factory {config["model_factory"]!r} returned {type(model)}, not torch.nn.Module.')
         if state_dict is not None:
             model.load_state_dict(_clean_state_dict(state_dict))
-        return LoadedModel(model, config.get('architecture'), checkpoint, checkpoint_kind, None, unsafe_pickle_load)
+        return LoadedModel(model, model_name, config.get('architecture'), checkpoint, checkpoint_kind, None, unsafe_pickle_load, load_notes)
 
     training_config_path = _training_config_path(checkpoint, config.get('training_config'))
     training_config = _load_json_config(training_config_path)
@@ -357,7 +547,8 @@ def load_model(config: dict[str, Any]) -> LoadedModel:
         training_config=training_config,
         model_kwargs=config['model_kwargs'],
     )
-    return LoadedModel(model, architecture, checkpoint, checkpoint_kind, training_config_path, unsafe_pickle_load)
+    model_name = _resolve_model_name(config, checkpoint, architecture)
+    return LoadedModel(model, model_name, architecture, checkpoint, checkpoint_kind, training_config_path, unsafe_pickle_load, load_notes)
 
 
 def prepare_model_for_export(model: torch.nn.Module) -> None:
@@ -612,17 +803,46 @@ def da4ml_project_report(outdir: Path) -> dict[str, Any]:
     return report
 
 
+def enrich_report_estimates(report: dict[str, Any]) -> dict[str, Any]:
+    report = report.copy()
+    if 'cost' in report:
+        report.setdefault('rough_LUT_estimate', report['cost'])
+    if 'clock_period' in report:
+        clock_period = float(report['clock_period'])
+        if clock_period > 0:
+            report.setdefault('target_Fmax(MHz)', 1000.0 / clock_period)
+    period = report.get('actual_period', report.get('clock_period'))
+    latency = report.get('latency')
+    if latency is not None and period is not None:
+        report.setdefault('target_latency(ns)', float(latency) * float(report.get('clock_period', period)))
+        if 'actual_period' in report:
+            report.setdefault('synth_latency(ns)', float(latency) * float(period))
+    if 'actual_period' in report:
+        report.setdefault('timing_estimate_source', 'synthesis_report')
+    elif 'clock_period' in report:
+        report.setdefault('timing_estimate_source', 'target_clock_metadata')
+    else:
+        report.setdefault('timing_estimate_source', 'logic_metadata')
+    return report
+
+
 def _write_markdown_report(path: Path, report: dict[str, Any]) -> None:
     preferred = [
         'flavor',
         'part_name',
         'cost',
+        'rough_LUT_estimate',
+        'comb_latency',
         'latency',
         'latency_cutoff',
         'clock_period',
+        'target_Fmax(MHz)',
+        'target_latency(ns)',
         'actual_period',
         'Fmax(MHz)',
+        'synth_latency(ns)',
         'latency(ns)',
+        'timing_estimate_source',
         'LUT',
         'FF',
         'DSP',
@@ -641,7 +861,7 @@ def _write_markdown_report(path: Path, report: dict[str, Any]) -> None:
 
 
 def write_reports(outdir: Path, formats: Sequence[str]) -> dict[str, Any]:
-    report = da4ml_project_report(outdir)
+    report = enrich_report_estimates(da4ml_project_report(outdir))
     analysis_dir = outdir / 'analysis'
     analysis_dir.mkdir(parents=True, exist_ok=True)
     for fmt in formats:
@@ -655,8 +875,8 @@ def write_reports(outdir: Path, formats: Sequence[str]) -> dict[str, Any]:
     return report
 
 
-def default_outdir(checkpoint: Path | None, architecture: str | None) -> Path:
-    name = architecture or (checkpoint.stem if checkpoint is not None else 'torchlogix_model')
+def default_outdir(checkpoint: Path | None, architecture: str | None, model_name: str | None) -> Path:
+    name = model_name or architecture or (checkpoint.stem if checkpoint is not None else 'torch_model')
     return Path('build') / 'da4ml' / name
 
 
@@ -672,7 +892,9 @@ def convert(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError('Unable to infer input shape. Pass --input-shape, for example --input-shape 1,1,28,28.')
 
     input_kif = choose_input_kif(config['input_kif'], loaded.model)
-    outdir = config['outdir'] or default_outdir(loaded.checkpoint, loaded.architecture)
+    model_name = loaded.model_name or _resolve_model_name(config, loaded.checkpoint, loaded.architecture) or 'torch_model'
+    project_name = config['project_name'] or _sanitize_project_name(model_name)
+    outdir = config['outdir'] or default_outdir(loaded.checkpoint, loaded.architecture, model_name)
     outdir = outdir.resolve()
     if outdir.exists() and any(outdir.iterdir()) and not config['overwrite']:
         raise FileExistsError(f'Output directory is not empty: {outdir}. Pass --overwrite to reuse it.')
@@ -682,7 +904,8 @@ def convert(config: dict[str, Any]) -> dict[str, Any]:
     comb = trace_to_comb(loaded.model, symbolic_inputs, config['hw_config'], config['solver_options'])
 
     metadata = {
-        'source_framework': 'torchlogix',
+        'source_framework': 'torch',
+        'model_name': model_name,
         'source_checkpoint': str(loaded.checkpoint) if loaded.checkpoint else None,
         'checkpoint_kind': loaded.checkpoint_kind,
         'architecture': loaded.architecture,
@@ -691,11 +914,15 @@ def convert(config: dict[str, Any]) -> dict[str, Any]:
         'input_kif': input_kif,
         'hw_config': config['hw_config'],
         'unsafe_pickle_load': loaded.unsafe_pickle_load,
+        'load_notes': loaded.load_notes,
+        'comb_shape': comb.shape,
+        'comb_cost': comb.cost,
+        'comb_latency': comb.latency,
     }
 
     rtl_model = RTLModel(
         comb,
-        config['project_name'],
+        project_name,
         outdir,
         flavor=config['flavor'],
         latency_cutoff=config['latency_cutoff'],
@@ -754,9 +981,11 @@ def convert(config: dict[str, Any]) -> dict[str, Any]:
 
     conversion_summary = {
         'outdir': outdir,
-        'project_name': config['project_name'],
+        'project_name': project_name,
+        'model_name': model_name,
         'architecture': loaded.architecture,
         'checkpoint': loaded.checkpoint,
+        'checkpoint_kind': loaded.checkpoint_kind,
         'training_config': loaded.training_config,
         'input_shape': input_shapes,
         'input_kif': input_kif,
@@ -765,6 +994,7 @@ def convert(config: dict[str, Any]) -> dict[str, Any]:
         'comb_latency': comb.latency,
         'validation': validation,
         'report': report,
+        'load_notes': loaded.load_notes,
     }
 
     analysis_dir = outdir / 'analysis'
@@ -788,13 +1018,20 @@ def list_architectures() -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Convert a TorchLogix PyTorch checkpoint to a DA4ML RTL project.')
+    parser = argparse.ArgumentParser(description='Convert a supported PyTorch/TorchLogix model to a DA4ML RTL project.')
     parser.add_argument('--config', type=Path, default=None, help='JSON conversion config. CLI options override config values.')
+    parser.add_argument(
+        '--model',
+        default=None,
+        help='Model name under --models-root or a checkpoint path. This is the usual one-argument model selector.',
+    )
+    parser.add_argument('--model-name', default=None, help='Human-readable model name used for default output naming.')
+    parser.add_argument('--models-root', type=Path, default=None, help='Directory searched by --model. Default: models/.')
     parser.add_argument(
         '--checkpoint',
         type=Path,
         default=None,
-        help='TorchLogix checkpoint. Defaults to a unique best-model file under models/.',
+        help='PyTorch/TorchLogix checkpoint. Defaults to --model lookup or a unique best-model file under --models-root.',
     )
     parser.add_argument('--outdir', type=Path, default=None, help='DA4ML project output directory. Default: build/da4ml/<model>.')
     parser.add_argument('--project-name', default=None, help='Generated top-level RTL project/module name.')
@@ -810,6 +1047,12 @@ def build_parser() -> argparse.ArgumentParser:
         help='Import path for a callable returning torch.nn.Module, e.g. package.module:make_model.',
     )
     parser.add_argument('--model-kwargs', default=None, help='JSON object or path with kwargs for --model-factory/architecture.')
+    parser.add_argument(
+        '--sequential-fallback',
+        choices=('auto', 'never'),
+        default=None,
+        help='When a full-module checkpoint references a missing top-level class, auto-load it as an ordered child-module chain.',
+    )
     parser.add_argument(
         '--input-shape',
         default=None,
@@ -895,6 +1138,79 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _estimate_lines(report: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    source = report.get('timing_estimate_source', 'logic_metadata')
+    if 'rough_LUT_estimate' in report:
+        lines.append(f'Rough LUT estimate: {float(report["rough_LUT_estimate"]):.0f}')
+    if 'latency' in report:
+        lines.append(f'Pipeline latency: {report["latency"]} cycles')
+    if 'target_Fmax(MHz)' in report:
+        lines.append(f'Target Fmax: {float(report["target_Fmax(MHz)"]):.2f} MHz')
+    if 'target_latency(ns)' in report:
+        lines.append(f'Target latency: {float(report["target_latency(ns)"]):.2f} ns')
+    if 'Fmax(MHz)' in report:
+        lines.append(f'Synthesis Fmax: {float(report["Fmax(MHz)"]):.2f} MHz')
+    if 'synth_latency(ns)' in report:
+        lines.append(f'Synthesis latency: {float(report["synth_latency(ns)"]):.2f} ns')
+    if any(key in report for key in ('LUT', 'FF', 'DSP', 'RAMB18', 'Block RAM Tile')):
+        resource_parts = [f'{key}={report[key]}' for key in ('LUT', 'FF', 'DSP', 'RAMB18', 'Block RAM Tile') if key in report]
+        lines.append('Synthesis resources: ' + ', '.join(resource_parts))
+    lines.append(f'Estimate source: {source}')
+    return lines
+
+
+def print_estimate(report: dict[str, Any]) -> None:
+    for line in _estimate_lines(report):
+        print(line)
+
+
+def build_estimate_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Print rough timing/resource estimates from DA4ML RTL project directories.')
+    parser.add_argument('paths', type=Path, nargs='+', help='DA4ML RTL project directories.')
+    parser.add_argument('--format', choices=('text', 'json', 'md'), default='text', help='Output format.')
+    parser.add_argument('--output', '-o', type=Path, default=None, help='Optional output file. Defaults to stdout.')
+    return parser
+
+
+def _format_estimate_output(paths: Sequence[Path], reports: Sequence[dict[str, Any]], fmt: str) -> str:
+    if fmt == 'json':
+        payload = [
+            {
+                'path': str(path),
+                'report': _serializable(report),
+            }
+            for path, report in zip(paths, reports)
+        ]
+        return json.dumps(payload[0] if len(payload) == 1 else payload, indent=2)
+    if fmt == 'md':
+        rows = ['| project | metric | value |', '|---|---|---|']
+        for path, report in zip(paths, reports):
+            for line in _estimate_lines(report):
+                metric, _, value = line.partition(': ')
+                rows.append(f'| {path} | {metric} | {value} |')
+        return '\n'.join(rows)
+
+    chunks: list[str] = []
+    for path, report in zip(paths, reports):
+        if len(paths) > 1:
+            chunks.append(f'{path}:')
+        chunks.extend(_estimate_lines(report))
+    return '\n'.join(chunks)
+
+
+def estimate_main(argv: Sequence[str] | None = None) -> int:
+    parser = build_estimate_parser()
+    args = parser.parse_args(argv)
+    reports = [enrich_report_estimates(da4ml_project_report(path)) for path in args.paths]
+    output = _format_estimate_output(args.paths, reports, args.format)
+    if args.output is None:
+        print(output)
+    else:
+        args.output.write_text(output + '\n')
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -908,6 +1224,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f'Wrote analysis reports: {summary["outdir"] / "analysis"}')
     print(f'Comb shape: {summary["comb_shape"][0]} inputs -> {summary["comb_shape"][1]} outputs')
     print(f'Estimated DA4ML cost: {summary["comb_cost"]:.0f} LUTs')
+    print_estimate(summary['report'])
     return 0
 
 

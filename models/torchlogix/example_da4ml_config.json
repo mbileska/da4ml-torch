@@ -1,5 +1,6 @@
 {
-  "checkpoint": "models/torchlogix/<experiment>/best_model.pt",
+  "model": "<experiment>",
+  "models_root": "models/torchlogix",
   "training_config": "auto",
   "architecture": null,
   "input_shape": [1, 1, 28, 28],

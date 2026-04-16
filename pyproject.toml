@@ -30,6 +30,8 @@ entry-points."dais_tracer.plugins".torch = "da4ml_torch.parser:TorchParser"
 entry-points."dais_tracer.plugins".torchlogix = "da4ml_torch.parser:TorchParser"
 
 [project.scripts]
+da4ml-torch-convert = "da4ml_torch.tools.torchlogix_to_da4ml:main"
+da4ml-torch-estimate = "da4ml_torch.tools.torchlogix_to_da4ml:estimate_main"
 da4ml-torchlogix-convert = "da4ml_torch.tools.torchlogix_to_da4ml:main"
 
 [tool.setuptools]
