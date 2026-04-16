@@ -102,3 +102,16 @@ def test_enrich_report_estimates_adds_target_timing():
     assert report['target_Fmax(MHz)'] == 200.0
     assert report['target_latency(ns)'] == 35.0
     assert report['timing_estimate_source'] == 'target_clock_metadata'
+
+
+def test_make_vivado_script_compatible_removes_global_retiming(tmp_path):
+    script = tmp_path / 'build_vivado_prj.tcl'
+    script.write_text(
+        'synth_design -top $top_module -mode out_of_context -global_retiming on \\\n'
+        '    -flatten_hierarchy full\n'
+    )
+
+    patched = tool.make_vivado_script_compatible(tmp_path)
+
+    assert patched == (script,)
+    assert '-global_retiming' not in script.read_text()

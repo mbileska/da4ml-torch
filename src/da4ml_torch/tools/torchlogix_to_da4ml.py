@@ -794,6 +794,20 @@ def run_synthesis(tool: str, outdir: Path) -> None:
     subprocess.run(command, cwd=outdir, check=True)
 
 
+def make_vivado_script_compatible(outdir: Path) -> tuple[Path, ...]:
+    patched: list[Path] = []
+    for script_name in ('build_vivado_prj.tcl', 'build_vivado_hls_prj.tcl'):
+        script = outdir / script_name
+        if not script.exists():
+            continue
+        text = script.read_text()
+        updated = text.replace(' -global_retiming on', '')
+        if updated != text:
+            script.write_text(updated)
+            patched.append(script)
+    return tuple(patched)
+
+
 def da4ml_project_report(outdir: Path) -> dict[str, Any]:
     from da4ml._cli.report import load_project
 
@@ -932,6 +946,7 @@ def convert(config: dict[str, Any]) -> dict[str, Any]:
         part_name=config['part_name'],
     )
     rtl_model.write(metadata)
+    make_vivado_script_compatible(outdir)
 
     validation_mode = _validation_mode(config['validation_input_mode'], loaded.model)
     validation: dict[str, Any] = {}
