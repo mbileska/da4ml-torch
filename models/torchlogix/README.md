@@ -12,7 +12,7 @@ The converter can load:
 
 For full-module checkpoints that only need to run child modules in registration
 order, the converter can auto-load a missing top-level model class. That removes
-the need for one-off compatibility classes such as `models.classification.*`.
+the need for one-off per-checkpoint compatibility classes.
 If a checkpoint has branches, multiple inputs, or custom control flow, provide
 `--model-factory package.module:make_model` so the real `forward` method is
 available.
