@@ -10,6 +10,18 @@ from pickle import Unpickler
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
+def set_export_mode(model: torch.nn.Module, enabled: bool) -> None:
+    for module in model.modules():
+        if hasattr(module, 'set_export_mode'):
+            module.set_export_mode(enabled)
+
+
+def torch_input(data: np.ndarray) -> torch.Tensor:
+    if data.dtype == np.bool_:
+        data = data.astype(np.float32)
+    return torch.from_numpy(data)
+
+
 def assert_comb_matches_model(
     model: torch.nn.Module,
     symbolic_shape: tuple[int, ...],
@@ -17,15 +29,14 @@ def assert_comb_matches_model(
 ) -> None:
     """Trace model, run comb prediction, and assert outputs match PyTorch."""
     model.eval()
-    for module in model.modules():
-        if hasattr(module, 'set_export_mode'):
-            module.set_export_mode(True)
+    set_export_mode(model, True)
 
     inp, out = trace_model(model, inputs=FixedVariableArrayInput(symbolic_shape).quantize(0, 1, 1))
     comb = comb_trace(inp, out)
 
+    set_export_mode(model, False)
     with torch.no_grad():
-        torch_out = model(torch.from_numpy(data_in)).detach().cpu().numpy()
+        torch_out = model(torch_input(data_in)).detach().cpu().numpy()
 
     comb_out = np.asarray(comb.predict(data_in))
 
