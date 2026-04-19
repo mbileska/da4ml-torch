@@ -50,9 +50,6 @@ DEFAULTS: dict[str, Any] = {
     'overwrite': False,
 }
 
-ASIC_LOGIC_ESTIMATE_UNIT = 'DA4ML cost units'
-ASIC_ESTIMATE_SOURCE = 'DA4ML logic metadata'
-
 CHECKPOINT_PATTERNS = (
     'best_model.pt',
     'best_model.pth',
@@ -824,12 +821,7 @@ def enrich_report_estimates(report: dict[str, Any]) -> dict[str, Any]:
     report = report.copy()
     if 'cost' in report:
         report.setdefault('rough_LUT_estimate', report['cost'])
-        report.setdefault('rough_ASIC_logic_estimate', report['cost'])
-        report.setdefault('ASIC_logic_estimate_unit', ASIC_LOGIC_ESTIMATE_UNIT)
-    if 'reg_bits' in report:
-        report.setdefault('rough_ASIC_register_bits', report['reg_bits'])
-    if 'rough_ASIC_logic_estimate' in report or 'rough_ASIC_register_bits' in report:
-        report.setdefault('ASIC_estimate_source', ASIC_ESTIMATE_SOURCE)
+        report.setdefault('rough_ASIC_estimate', report['cost'])
     if 'clock_period' in report:
         clock_period = float(report['clock_period'])
         if clock_period > 0:
@@ -855,10 +847,7 @@ def _write_markdown_report(path: Path, report: dict[str, Any]) -> None:
         'part_name',
         'cost',
         'rough_LUT_estimate',
-        'rough_ASIC_logic_estimate',
-        'ASIC_logic_estimate_unit',
-        'rough_ASIC_register_bits',
-        'ASIC_estimate_source',
+        'rough_ASIC_estimate',
         'comb_latency',
         'latency',
         'latency_cutoff',
@@ -1171,11 +1160,8 @@ def _estimate_lines(report: dict[str, Any]) -> list[str]:
     source = report.get('timing_estimate_source', 'logic_metadata')
     if 'rough_LUT_estimate' in report:
         lines.append(f'Rough LUT estimate: {float(report["rough_LUT_estimate"]):.0f}')
-    if 'rough_ASIC_logic_estimate' in report:
-        unit = report.get('ASIC_logic_estimate_unit', ASIC_LOGIC_ESTIMATE_UNIT)
-        lines.append(f'Rough ASIC logic estimate: {float(report["rough_ASIC_logic_estimate"]):.0f} {unit}')
-    if 'rough_ASIC_register_bits' in report:
-        lines.append(f'Rough ASIC register estimate: {int(report["rough_ASIC_register_bits"])} bits')
+    if 'rough_ASIC_estimate' in report:
+        lines.append(f'Rough ASIC estimate: {float(report["rough_ASIC_estimate"]):.0f}')
     if 'latency' in report:
         lines.append(f'Pipeline latency: {report["latency"]} cycles')
     if 'target_Fmax(MHz)' in report:
@@ -1189,8 +1175,6 @@ def _estimate_lines(report: dict[str, Any]) -> list[str]:
     if any(key in report for key in ('LUT', 'FF', 'DSP', 'RAMB18', 'Block RAM Tile')):
         resource_parts = [f'{key}={report[key]}' for key in ('LUT', 'FF', 'DSP', 'RAMB18', 'Block RAM Tile') if key in report]
         lines.append('Synthesis resources: ' + ', '.join(resource_parts))
-    if 'ASIC_estimate_source' in report:
-        lines.append(f'ASIC estimate source: {report["ASIC_estimate_source"]}')
     lines.append(f'Estimate source: {source}')
     return lines
 

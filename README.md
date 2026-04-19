@@ -58,10 +58,10 @@ scripts/estimate_da4ml_torch.py build/da4ml/my_lgn
 ```
 
 This reports DA4ML-side metadata: rough LUT estimate from `cost`, rough ASIC
-logic estimate in DA4ML cost units, pipeline register bits when available,
-target Fmax from `clock_period`, and target latency for pipelined designs. If
-Vivado or Quartus reports exist in the project directory, the same command also
-includes synthesis timing and resource numbers.
+estimate from the same `cost`, target Fmax from `clock_period`, and target
+latency for pipelined designs. If Vivado or Quartus reports exist in the
+project directory, the same command also includes synthesis timing and resource
+numbers.
 
 The ASIC estimate is not a cell-library area or gate-equivalent synthesis
 report. It is a technology-independent proxy for comparing model sizes without
@@ -315,8 +315,7 @@ Without vendor synthesis, reports contain DA4ML-side estimates and target-clock
 metadata:
 
 - rough LUT estimate from DA4ML cost,
-- rough ASIC logic estimate in DA4ML cost units,
-- rough ASIC register estimate from pipeline register bits,
+- rough ASIC estimate from DA4ML cost,
 - target Fmax from `clock_period`,
 - target latency in nanoseconds for pipelined designs.
 
