@@ -36,6 +36,44 @@ Print estimates from an existing generated project:
 scripts/estimate_da4ml_torch.py build/da4ml/best_model
 ```
 
+## Estimate An LGN Without Vivado
+
+Vivado or Quartus is only needed for real synthesis reports. For a quick local
+estimate, leave synthesis disabled. This is the default, but it is fine to pass
+`--synthesis-tool none` explicitly:
+
+```bash
+scripts/convert_torch_to_da4ml.py \
+  --model /path/to/model.pth \
+  --model-name my_lgn \
+  --input-shape 1,NUM_INPUTS \
+  --synthesis-tool none \
+  --overwrite
+```
+
+Then print the estimate:
+
+```bash
+scripts/estimate_da4ml_torch.py build/da4ml/my_lgn
+```
+
+This reports DA4ML-side metadata: rough LUT estimate from `cost`, target Fmax
+from `clock_period`, and target latency for pipelined designs. If Vivado or
+Quartus reports exist in the project directory, the same command also includes
+synthesis timing and resource numbers.
+
+For a state-dict checkpoint or a custom model constructor, expose a small
+factory and point the converter at it:
+
+```bash
+scripts/convert_torch_to_da4ml.py \
+  --model-factory my_model_file:make_model \
+  --model-name my_lgn \
+  --input-shape 1,NUM_INPUTS \
+  --synthesis-tool none \
+  --overwrite
+```
+
 If the package is installed, the same tools are available as console commands:
 
 ```bash
@@ -262,11 +300,18 @@ RTL validation requires the local Verilog/VHDL simulation toolchain used by DA4M
 
 ## Timing And Resource Estimates
 
-Without vendor synthesis, reports contain DA4ML-side estimates and target-clock metadata:
+The estimate command works on any generated DA4ML project:
+
+```bash
+scripts/estimate_da4ml_torch.py build/da4ml/best_model
+```
+
+Without vendor synthesis, reports contain DA4ML-side estimates and target-clock
+metadata:
 
 - rough LUT estimate from DA4ML cost,
 - target Fmax from `clock_period`,
-- target latency in nanoseconds when the design is pipelined.
+- target latency in nanoseconds for pipelined designs.
 
 With Vivado or Quartus synthesis, reports can also include parsed implementation data:
 
@@ -275,12 +320,6 @@ With Vivado or Quartus synthesis, reports can also include parsed implementation
 - latency in nanoseconds,
 - LUT/FF/DSP/BRAM-style resource usage,
 - power when available.
-
-Print estimates from a project:
-
-```bash
-scripts/estimate_da4ml_torch.py build/da4ml/best_model
-```
 
 Write estimates as JSON:
 
