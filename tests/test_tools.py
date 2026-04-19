@@ -96,12 +96,26 @@ def test_auto_sequential_checkpoint_fallback_can_be_disabled(tmp_path):
 
 
 def test_enrich_report_estimates_adds_target_timing():
-    report = tool.enrich_report_estimates({'cost': 123, 'clock_period': 5.0, 'latency': 7})
+    report = tool.enrich_report_estimates({'cost': 123, 'reg_bits': 456, 'clock_period': 5.0, 'latency': 7})
 
     assert report['rough_LUT_estimate'] == 123
+    assert report['rough_ASIC_logic_estimate'] == 123
+    assert report['ASIC_logic_estimate_unit'] == 'DA4ML cost units'
+    assert report['rough_ASIC_register_bits'] == 456
+    assert report['ASIC_estimate_source'] == 'DA4ML logic metadata'
     assert report['target_Fmax(MHz)'] == 200.0
     assert report['target_latency(ns)'] == 35.0
     assert report['timing_estimate_source'] == 'target_clock_metadata'
+
+
+def test_estimate_lines_include_asic_metadata():
+    report = tool.enrich_report_estimates({'cost': 123, 'reg_bits': 456})
+
+    lines = tool._estimate_lines(report)
+
+    assert 'Rough ASIC logic estimate: 123 DA4ML cost units' in lines
+    assert 'Rough ASIC register estimate: 456 bits' in lines
+    assert 'ASIC estimate source: DA4ML logic metadata' in lines
 
 
 def test_make_vivado_script_compatible_removes_global_retiming(tmp_path):
