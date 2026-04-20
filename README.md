@@ -67,6 +67,33 @@ The ASIC estimate is not a cell-library area or gate-equivalent synthesis
 report. It is a technology-independent proxy for comparing model sizes without
 requiring ASIC tools.
 
+Examples for the two local LGN checkpoints:
+
+```bash
+# Model 2: models/best_model.pth
+scripts/convert_torch_to_da4ml.py \
+  --checkpoint models/best_model.pth \
+  --model-name lgn-dense-2-dense-100_128_-lessFeat_40 \
+  --outdir build/da4ml/model2_25ns_total \
+  --latency-cutoff 5 \
+  --clock-period 4.1666667 \
+  --synthesis-tool none \
+  --overwrite
+
+# Model 3: models/lgn-conv-3-100-orpool_128_20/best_model.pth
+scripts/convert_torch_to_da4ml.py \
+  --checkpoint models/lgn-conv-3-100-orpool_128_20/best_model.pth \
+  --model-name lgn-conv-3-100-orpool_128_20 \
+  --outdir build/da4ml/model3_25ns_total \
+  --latency-cutoff 5 \
+  --clock-period 3.5714286 \
+  --synthesis-tool none \
+  --overwrite
+```
+
+The model 2 command uses a 6-cycle pipeline target, so `25 ns / 6 = 4.1666667 ns`.
+The model 3 command uses a 7-cycle pipeline target, so `25 ns / 7 = 3.5714286 ns`.
+
 For a state-dict checkpoint or a custom model constructor, expose a small
 factory and point the converter at it:
 
@@ -198,7 +225,7 @@ for child in model.children():
 return x
 ```
 
-For models with branches, skip connections, multiple inputs, or custom forward logic, use a model factory.
+For models with branches, skip connections, reshapes, concatenation, multiple inputs, or other custom forward logic, use a model factory. Conversion requires the real forward method; the auto-sequential fallback is rejected for conversion so it cannot trace the wrong graph.
 
 ### State Dict Checkpoints
 
@@ -291,7 +318,7 @@ scripts/convert_torch_to_da4ml.py \
   --overwrite
 ```
 
-Compile and validate generated RTL against DA4ML combinational simulation:
+Compile and validate generated RTL against the PyTorch model output:
 
 ```bash
 scripts/convert_torch_to_da4ml.py \
@@ -345,7 +372,7 @@ Currently supported model components include:
 - `torchlogix.layers.OrPooling2d`
 - TorchLogix binarization layers
 - `torch.nn.Flatten`
-- supported `reshape`, `flatten`, `transpose`, `matmul`, and basic arithmetic patterns
+- supported `reshape`, `view`, `flatten`, `size`, `transpose`, `matmul`, `torch.cat`, indexing/slicing, and basic arithmetic patterns
 
 Unsupported or likely unsupported examples include:
 

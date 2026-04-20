@@ -551,6 +551,17 @@ def load_model(config: dict[str, Any]) -> LoadedModel:
     return LoadedModel(model, model_name, architecture, checkpoint, checkpoint_kind, training_config_path, unsafe_pickle_load, load_notes)
 
 
+def require_real_forward_for_conversion(loaded: LoadedModel) -> None:
+    if loaded.checkpoint_kind != 'full_module_auto_sequential':
+        return
+    raise ValueError(
+        'The checkpoint was loaded with the auto-sequential fallback because the original top-level model class '
+        'was not importable. That fallback can preserve child modules, but it cannot reconstruct a custom forward() '
+        'with reshape, flatten, concatenation, branching, skip connections, or other dataflow. Make the original '
+        'model class importable, or pass --model-factory for a callable that rebuilds the real model before conversion.'
+    )
+
+
 def prepare_model_for_export(model: torch.nn.Module) -> None:
     model.cpu()
     model.eval()
@@ -592,6 +603,16 @@ def has_threshold_binarization(model: torch.nn.Module) -> bool:
     return any(_is_threshold_binarization(module) for module in model.modules())
 
 
+def _raw_shape_from_threshold_binarization(module: torch.nn.Module) -> tuple[int, ...] | None:
+    thresholds = module.get_thresholds()
+    if thresholds.ndim != 2:
+        return None
+    feature_dim = getattr(module, 'feature_dim', -2)
+    if feature_dim == -2:
+        return (1, int(thresholds.shape[0]))
+    return None
+
+
 def infer_input_shapes(model: torch.nn.Module) -> tuple[tuple[int, ...], ...] | None:
     try:
         from torchlogix.layers import LogicConv2d, LogicDense
@@ -608,6 +629,9 @@ def infer_input_shapes(model: torch.nn.Module) -> tuple[tuple[int, ...], ...] | 
             continue
         if isinstance(module, LogicConv2d):
             if first_binarization is not None and not _is_dummy_binarization(first_binarization):
+                raw_shape = _raw_shape_from_threshold_binarization(first_binarization)
+                if raw_shape is not None:
+                    return (raw_shape,)
                 thresholds = first_binarization.get_thresholds()
                 n_bits = int(thresholds.shape[-1])
                 raw_channels = module.channels // n_bits if module.channels % n_bits == 0 else module.channels
@@ -615,6 +639,9 @@ def infer_input_shapes(model: torch.nn.Module) -> tuple[tuple[int, ...], ...] | 
             return ((1, module.channels, *module.in_dim),)
         if isinstance(module, LogicDense):
             if first_binarization is not None and not _is_dummy_binarization(first_binarization):
+                raw_shape = _raw_shape_from_threshold_binarization(first_binarization)
+                if raw_shape is not None:
+                    return (raw_shape,)
                 thresholds = first_binarization.get_thresholds()
                 n_bits = int(thresholds.shape[-1])
                 raw_dim = module.in_dim // n_bits if module.in_dim % n_bits == 0 else module.in_dim
@@ -711,6 +738,20 @@ def _flatten_model_output(output: Any, n_samples: int) -> np.ndarray:
     return np.asarray(output).reshape(n_samples, -1)
 
 
+def _torch_reference_output(model: torch.nn.Module, data: tuple[np.ndarray, ...], n_samples: int) -> np.ndarray:
+    torch_inputs = [
+        torch.from_numpy(item.astype(np.float32) if item.dtype == np.bool_ else item)
+        for item in data
+    ]
+    restore_export = _temporarily_disable_export_for_torch_validation(model)
+    try:
+        with torch.no_grad():
+            return _flatten_model_output(model(*torch_inputs), n_samples)
+    finally:
+        if restore_export:
+            set_logic_export_mode(model, True)
+
+
 def validate_comb(
     model: torch.nn.Module,
     comb: Any,
@@ -723,17 +764,7 @@ def validate_comb(
     atol: float,
 ) -> ValidationSummary:
     data = make_validation_inputs(shapes, n_samples, input_kif, mode, value_range)
-    torch_inputs = [
-        torch.from_numpy(item.astype(np.float32) if item.dtype == np.bool_ else item)
-        for item in data
-    ]
-    restore_export = _temporarily_disable_export_for_torch_validation(model)
-    try:
-        with torch.no_grad():
-            torch_out = _flatten_model_output(model(*torch_inputs), n_samples)
-    finally:
-        if restore_export:
-            set_logic_export_mode(model, True)
+    torch_out = _torch_reference_output(model, data, n_samples)
 
     comb_input: Any = data[0] if len(data) == 1 else data
     comb_out = np.asarray(comb.predict(comb_input, n_threads=n_threads)).reshape(n_samples, -1)
@@ -750,8 +781,8 @@ def validate_comb(
 
 
 def validate_rtl(
+    model: torch.nn.Module,
     rtl_model: Any,
-    comb: Any,
     shapes: tuple[tuple[int, ...], ...],
     n_samples: int,
     input_kif: tuple[int, int, int],
@@ -761,10 +792,11 @@ def validate_rtl(
     atol: float,
 ) -> ValidationSummary:
     data = make_validation_inputs(shapes, n_samples, input_kif, mode, value_range)
+    torch_out = _torch_reference_output(model, data, n_samples)
+
     comb_input: Any = data[0] if len(data) == 1 else data
-    comb_out = np.asarray(comb.predict(comb_input, n_threads=n_threads)).reshape(n_samples, -1)
     rtl_out = np.asarray(rtl_model.predict(comb_input, n_threads=n_threads)).reshape(n_samples, -1)
-    diff = np.abs(comb_out - rtl_out)
+    diff = np.abs(torch_out - rtl_out)
     mismatches = int(np.sum(diff > atol))
     total = int(diff.size)
     return ValidationSummary(
@@ -901,6 +933,7 @@ def convert(config: dict[str, Any]) -> dict[str, Any]:
     from da4ml.codegen import RTLModel
 
     loaded = load_model(config)
+    require_real_forward_for_conversion(loaded)
     prepare_model_for_export(loaded.model)
 
     input_shapes = config['input_shape'] or infer_input_shapes(loaded.model)
@@ -973,8 +1006,8 @@ def convert(config: dict[str, Any]) -> dict[str, Any]:
 
     if config['validate_rtl_samples']:
         summary = validate_rtl(
+            loaded.model,
             rtl_model,
-            comb,
             input_shapes,
             int(config['validate_rtl_samples']),
             input_kif,
@@ -1112,7 +1145,7 @@ def build_parser() -> argparse.ArgumentParser:
         '--validate-rtl-samples',
         type=int,
         default=None,
-        help='Random samples for DA4ML comb vs compiled RTL validation.',
+        help='Random samples for PyTorch model vs compiled RTL validation.',
     )
     parser.add_argument(
         '--validation-input-mode',

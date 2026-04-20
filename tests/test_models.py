@@ -312,6 +312,21 @@ class ShapeAccessModel(torch.nn.Module):
         b = x.shape[0]
         return x.reshape(b, -1)
 
+
+class SliceViewCatModel(torch.nn.Module):
+    """
+    Tests common custom-forward shape plumbing before an LGN layer.
+    """
+    def __init__(self):
+        super().__init__()
+        self.layer = LogicDense(64, 64)
+
+    def forward(self, x):
+        head = x[:, :8]
+        tail = x[:, 8:].view(x.size(0), -1)
+        x = torch.cat((head, tail), dim=1)
+        return self.layer(x)
+
 # ---------------------------------------------------------------------------
 # Parametrized model tests
 # ---------------------------------------------------------------------------
@@ -332,6 +347,7 @@ class ShapeAccessModel(torch.nn.Module):
     (BroadcastModel,       (1, 64),         (2**10, 64)),
     (ScalarMulModel,       (1, 64),         (2**10, 64)),
     (ShapeAccessModel,     (1, 64),         (2**10, 64)),
+    (SliceViewCatModel,    (1, 64),         (2**10, 64)),
 ])
 def test_model_matches_comb_trace(model_cls, symbolic_shape, data_shape):
     """Parametrized test: verify comb trace matches PyTorch for each model."""

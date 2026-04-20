@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn.functional as F
 from da4ml.converter.plugin import DAISTracerPluginBase, _flatten_arr
@@ -18,8 +19,10 @@ SUPPORTED_METHODS = {
     'relu', 
     'reshape', 
     'rmatmul', 
+    'size',
     'to_bool', 
     'transpose',
+    'view',
 }
 
 SUPPORTED_FUNCTIONS = {
@@ -27,6 +30,9 @@ SUPPORTED_FUNCTIONS = {
     'reshape',
     'flatten',
     'matmul',
+    'cat',
+    'concat',
+    'concatenate',
 }
 
 OPERATOR_MAP = {
@@ -40,6 +46,43 @@ OPERATOR_MAP = {
 PASSTHROUGH_FUNCTIONS = {
     "getattr",
 }
+
+
+def _resolve_fx_value(value, env):
+    if isinstance(value, Node):
+        return env[value.name]
+    if isinstance(value, tuple):
+        return tuple(_resolve_fx_value(v, env) for v in value)
+    if isinstance(value, list):
+        return [_resolve_fx_value(v, env) for v in value]
+    if isinstance(value, dict):
+        return {k: _resolve_fx_value(v, env) for k, v in value.items()}
+    if isinstance(value, slice):
+        return slice(
+            _resolve_fx_value(value.start, env),
+            _resolve_fx_value(value.stop, env),
+            _resolve_fx_value(value.step, env),
+        )
+    return value
+
+
+def _find_fixed_variable_array(value):
+    if isinstance(value, FixedVariableArray):
+        return value
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            found = _find_fixed_variable_array(item)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, dict):
+        for item in value.values():
+            found = _find_fixed_variable_array(item)
+            if found is not None:
+                return found
+        return None
+    return None
+
 
 class DATracer(Tracer):
     def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str):
@@ -63,7 +106,7 @@ class TorchParser(DAISTracerPluginBase):
         tracer = DATracer()
         graph = tracer.trace(self.model)
         modules = dict(self.model.named_modules())
-        env: dict[str, FixedVariableArray] = {}
+        env: dict[str, object] = {}
         inp_nodes = [n for n in graph.nodes if n.op == 'placeholder']
         out_nodes = [n for n in graph.nodes if n.op == 'output']
         assert len(out_nodes) == 1, f'only one output node is supported, but found {len(out_nodes)}'
@@ -83,16 +126,26 @@ class TorchParser(DAISTracerPluginBase):
                     assert type(module) in _registered_modules, f'{type(module)} is not supported'
                     replay_cls = _registered_modules[type(module)]
                     replay = replay_cls(module)
-                    _args = tuple(env[n.name] for n in args)
-                    _lwargs = {k: env[v.name] for k, v in kwargs.items()}
+                    _args = _resolve_fx_value(args, env)
+                    _lwargs = _resolve_fx_value(kwargs, env)
                     env[node.name] = replay(*_args, **_lwargs)
                 case 'call_function':
-                    _args = tuple(env[n.name] if isinstance(n, Node) else n for n in args)
-                    _kwargs = {k: env[v.name] if isinstance(v, Node) else v for k, v in kwargs.items()}
-                    first_fva_arg = next((a for a in _args if isinstance(a, FixedVariableArray)), None)
+                    _args = _resolve_fx_value(args, env)
+                    _kwargs = _resolve_fx_value(kwargs, env)
+                    first_fva_arg = _find_fixed_variable_array(_args)
                     op_name = target.__name__
                     if op_name in PASSTHROUGH_FUNCTIONS:
                         env[node.name] = target(*_args, **_kwargs)
+                        continue
+                    if op_name == 'getitem':
+                        env[node.name] = _args[0][_args[1]]
+                        continue
+                    if op_name in {'cat', 'concat', 'concatenate'}:
+                        tensors = _args[0]
+                        axis = _kwargs.pop('dim', None)
+                        if axis is None:
+                            axis = _kwargs.pop('axis', 0)
+                        env[node.name] = np.concatenate(tensors, axis=axis, **_kwargs)
                         continue
                     if op_name in OPERATOR_MAP:
                         if first_fva_arg is None:
@@ -120,14 +173,20 @@ class TorchParser(DAISTracerPluginBase):
                     else:
                         env[node.name] = target(*_args, **_kwargs)
                 case 'call_method':
-                    _args = tuple(env[n.name] if isinstance(n, Node) else n for n in args)
-                    _kwargs = {k: env[v.name] if isinstance(v, Node) else v for k, v in kwargs.items()}
+                    _args = _resolve_fx_value(args, env)
+                    _kwargs = _resolve_fx_value(kwargs, env)
                     obj = _args[0]
                     if isinstance(obj, FixedVariableArray):
                         if target not in SUPPORTED_METHODS:
                             raise NotImplementedError(
                                 f"Method '{target}' is not supported for FixedVariableArray"
                             )
+                        if target == "view":
+                            env[node.name] = obj.reshape(*_args[1:], **_kwargs)
+                            continue
+                        if target == "size":
+                            env[node.name] = obj.shape[_args[1]] if len(_args) == 2 else obj.shape
+                            continue
                         if not hasattr(obj, target):
                             raise NotImplementedError(
                                 f"Method '{target}' declared supported but not implemented"
