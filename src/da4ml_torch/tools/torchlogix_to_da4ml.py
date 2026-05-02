@@ -492,6 +492,45 @@ def instantiate_torchlogix_model(
     return model
 
 
+def _registry_model_name(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get('format') != 'registry_state_dict':
+        return None
+    model_name = payload.get('model')
+    return model_name if isinstance(model_name, str) else None
+
+
+def instantiate_registered_model(
+    model_name: str,
+    state_dict: dict[str, torch.Tensor],
+    model_kwargs: dict[str, Any],
+) -> torch.nn.Module:
+    if model_name.startswith('towards-model-2-brevitas-'):
+        from da4ml_torch.brevitas_compat import make_quantized_towards_model2
+
+        model = make_quantized_towards_model2(model_name)
+    else:
+        importlib.import_module('models.classification')
+        registry = importlib.import_module('models.registry')
+        try:
+            registration = registry.MODEL_REGISTRY[model_name]
+        except KeyError as exc:
+            raise ValueError(f'Unknown registered model {model_name!r}.') from exc
+
+        model_cls = registration.cls
+        try:
+            model = model_cls(**model_kwargs)
+        except TypeError:
+            thresholds = _extract_thresholds(state_dict)
+            if thresholds is None:
+                raise
+            model = model_cls(thresholds=thresholds, **model_kwargs)
+
+    model.load_state_dict(_clean_state_dict(state_dict))
+    return model
+
+
 def load_model(config: dict[str, Any]) -> LoadedModel:
     checkpoint = config['checkpoint']
     if checkpoint is None and config.get('model'):
@@ -520,6 +559,7 @@ def load_model(config: dict[str, Any]) -> LoadedModel:
             kind = 'full_module_auto_sequential' if isinstance(model, AutoSequentialCheckpointModule) else 'full_module'
             return LoadedModel(model, model_name, None, checkpoint, kind, None, unsafe_pickle_load, load_notes)
         state_dict, checkpoint_kind = _extract_state_dict(payload)
+    registry_model_name = _registry_model_name(payload)
 
     if config.get('model_factory'):
         factory = _resolve_object(config['model_factory'])
@@ -529,6 +569,11 @@ def load_model(config: dict[str, Any]) -> LoadedModel:
         if state_dict is not None:
             model.load_state_dict(_clean_state_dict(state_dict))
         return LoadedModel(model, model_name, config.get('architecture'), checkpoint, checkpoint_kind, None, unsafe_pickle_load, load_notes)
+
+    if state_dict is not None and registry_model_name is not None:
+        model = instantiate_registered_model(registry_model_name, state_dict, config['model_kwargs'])
+        model_name = _resolve_model_name(config, checkpoint, registry_model_name)
+        return LoadedModel(model, model_name, registry_model_name, checkpoint, checkpoint_kind, None, unsafe_pickle_load, load_notes)
 
     training_config_path = _training_config_path(checkpoint, config.get('training_config'))
     training_config = _load_json_config(training_config_path)
@@ -603,6 +648,46 @@ def has_threshold_binarization(model: torch.nn.Module) -> bool:
     return any(_is_threshold_binarization(module) for module in model.modules())
 
 
+def _nested_attr(obj: Any, path: str, default: Any = None) -> Any:
+    cur = obj
+    for part in path.split('.'):
+        if not hasattr(cur, part):
+            return default
+        cur = getattr(cur, part)
+    return cur
+
+
+def _scalar_float(value: Any, default: float = 1.0) -> float:
+    if value is None:
+        return default
+    if torch.is_tensor(value):
+        return float(value.detach().cpu().reshape(()))
+    return float(value)
+
+
+def _quant_identity_input_kif(model: torch.nn.Module) -> tuple[int, int, int] | None:
+    from da4ml_torch.brevitas_compat import fixed_point_kif
+
+    for module in model.modules():
+        if hasattr(module, 'symbolic_input_kif'):
+            return module.symbolic_input_kif()
+        if type(module).__name__ != 'QuantIdentity':
+            continue
+        bit_width = getattr(module, 'bit_width', None)
+        if callable(bit_width):
+            bit_width = bit_width()
+        if torch.is_tensor(bit_width):
+            bit_width = int(bit_width.detach().cpu().reshape(()))
+        signed = bool(getattr(module, 'signed', True))
+        scale = _nested_attr(module, 'act_quant.fused_activation_quant_proxy.tensor_quant.scaling_impl.value', None)
+        return fixed_point_kif(None if bit_width is None else int(bit_width), signed, _scalar_float(scale))
+    return None
+
+
+def has_fixed_point_quantization(model: torch.nn.Module) -> bool:
+    return _quant_identity_input_kif(model) is not None or any(type(module).__name__ in {'QuantLinear', 'QuantReLU'} for module in model.modules())
+
+
 def _raw_shape_from_threshold_binarization(module: torch.nn.Module) -> tuple[int, ...] | None:
     thresholds = module.get_thresholds()
     if thresholds.ndim != 2:
@@ -614,6 +699,10 @@ def _raw_shape_from_threshold_binarization(module: torch.nn.Module) -> tuple[int
 
 
 def infer_input_shapes(model: torch.nn.Module) -> tuple[tuple[int, ...], ...] | None:
+    n_input_features = getattr(model, 'n_input_features', None)
+    if n_input_features is not None:
+        return ((1, int(n_input_features)),)
+
     try:
         from torchlogix.layers import LogicConv2d, LogicDense
         from torchlogix.layers.binarization import Binarization
@@ -647,6 +736,11 @@ def infer_input_shapes(model: torch.nn.Module) -> tuple[tuple[int, ...], ...] | 
                 raw_dim = module.in_dim // n_bits if module.in_dim % n_bits == 0 else module.in_dim
                 return ((1, raw_dim),)
             return ((1, module.in_dim),)
+
+    for module in model.modules():
+        in_features = getattr(module, 'in_features', None)
+        if in_features is not None:
+            return ((1, int(in_features)),)
     return None
 
 
@@ -655,6 +749,9 @@ def choose_input_kif(configured: tuple[int, int, int] | None, model: torch.nn.Mo
         return configured
     if has_threshold_binarization(model):
         return (0, 1, 8)
+    quant_kif = _quant_identity_input_kif(model)
+    if quant_kif is not None:
+        return quant_kif
     return (0, 1, 0)
 
 
@@ -690,7 +787,7 @@ def trace_to_comb(
 def _validation_mode(configured: str, model: torch.nn.Module) -> str:
     if configured != 'auto':
         return configured
-    return 'uniform' if has_threshold_binarization(model) else 'binary'
+    return 'uniform' if has_threshold_binarization(model) or has_fixed_point_quantization(model) else 'binary'
 
 
 def _make_one_validation_input(
@@ -797,6 +894,33 @@ def validate_rtl(
     comb_input: Any = data[0] if len(data) == 1 else data
     rtl_out = np.asarray(rtl_model.predict(comb_input, n_threads=n_threads)).reshape(n_samples, -1)
     diff = np.abs(torch_out - rtl_out)
+    mismatches = int(np.sum(diff > atol))
+    total = int(diff.size)
+    return ValidationSummary(
+        samples=n_samples,
+        total_outputs=total,
+        mismatches=mismatches,
+        max_abs_diff=float(np.max(diff)) if diff.size else 0.0,
+        passed=mismatches == 0,
+    )
+
+
+def validate_rtl_matches_comb(
+    comb: Any,
+    rtl_model: Any,
+    shapes: tuple[tuple[int, ...], ...],
+    n_samples: int,
+    input_kif: tuple[int, int, int],
+    mode: str,
+    value_range: tuple[float, float],
+    n_threads: int,
+    atol: float,
+) -> ValidationSummary:
+    data = make_validation_inputs(shapes, n_samples, input_kif, mode, value_range)
+    comb_input: Any = data[0] if len(data) == 1 else data
+    comb_out = np.asarray(comb.predict(comb_input, n_threads=n_threads)).reshape(n_samples, -1)
+    rtl_out = np.asarray(rtl_model.predict(comb_input, n_threads=n_threads)).reshape(n_samples, -1)
+    diff = np.abs(comb_out - rtl_out)
     mismatches = int(np.sum(diff > atol))
     total = int(diff.size)
     return ValidationSummary(
@@ -1019,6 +1143,21 @@ def convert(config: dict[str, Any]) -> dict[str, Any]:
         validation['rtl'] = _serializable(summary.__dict__)
         if not summary.passed:
             raise RuntimeError(f'RTL validation failed: {summary.mismatches}/{summary.total_outputs} mismatches.')
+
+        summary = validate_rtl_matches_comb(
+            comb,
+            rtl_model,
+            input_shapes,
+            int(config['validate_rtl_samples']),
+            input_kif,
+            validation_mode,
+            config['validation_input_range'],
+            config['n_threads'],
+            config['validation_atol'],
+        )
+        validation['rtl_vs_comb'] = _serializable(summary.__dict__)
+        if not summary.passed:
+            raise RuntimeError(f'RTL vs comb validation failed: {summary.mismatches}/{summary.total_outputs} mismatches.')
 
     run_synthesis(config['synthesis_tool'], outdir)
     report = write_reports(outdir, config['report_formats'])

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from da4ml.converter.plugin import DAISTracerPluginBase, _flatten_arr
 from da4ml.trace import FixedVariableArray
 from torch.fx import Node, Tracer
+from torch.fx.proxy import TraceError
 
 from .layers import _registered_modules
 
@@ -84,6 +85,25 @@ def _find_fixed_variable_array(value):
     return None
 
 
+def _call_replay_module(module: torch.nn.Module, value):
+    if type(module) in _registered_modules:
+        return _registered_modules[type(module)](module)(value)
+    if isinstance(module, (torch.nn.Sequential, torch.nn.ModuleList)):
+        for child in module.children():
+            value = _call_replay_module(child, value)
+        return value
+
+    children = list(module.children())
+    if children:
+        for child in children:
+            value = _call_replay_module(child, value)
+        return value
+
+    if isinstance(module, torch.nn.Identity):
+        return value
+    raise NotImplementedError(f'{type(module)} is not supported by sequential replay fallback')
+
+
 class DATracer(Tracer):
     def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str):
         if type(m) in _registered_modules:
@@ -92,6 +112,20 @@ class DATracer(Tracer):
 
 
 class TorchParser(DAISTracerPluginBase):
+    def _can_use_module_traversal(self) -> bool:
+        if isinstance(self.model, (torch.nn.Sequential, torch.nn.ModuleList)):
+            return True
+        return 'lgn' in type(self.model).__name__.lower()
+
+    def _trace_by_module_traversal(self, inputs, dump: bool = False):
+        if not self._can_use_module_traversal():
+            raise TraceError('FX tracing failed and module traversal fallback is only enabled for LGN/sequential models.')
+        assert len(inputs) == 1, 'Sequential replay fallback currently supports a single input.'
+        output = _call_replay_module(self.model, inputs[0])
+        if not dump:
+            return _flatten_arr(inputs), _flatten_arr(output)
+        return {'input_0': inputs[0], 'output': output}
+
     def trace(
         self,
         verbose: bool = False,
@@ -104,7 +138,10 @@ class TorchParser(DAISTracerPluginBase):
             inputs = (inputs,)
         self.model: torch.nn.Module
         tracer = DATracer()
-        graph = tracer.trace(self.model)
+        try:
+            graph = tracer.trace(self.model)
+        except TraceError:
+            return self._trace_by_module_traversal(inputs, dump=dump)
         modules = dict(self.model.named_modules())
         env: dict[str, object] = {}
         inp_nodes = [n for n in graph.nodes if n.op == 'placeholder']
